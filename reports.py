@@ -11,7 +11,7 @@ MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май"
           "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
 MON_SHORT = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
 KIND_NAMES = {"tip": "Чаевые", "cash": "Наличка", "car": "Машина", "fuel": "Заправка", "other": "Прочее"}
-KEYS = ("yandex", "tips", "car", "fuel", "other", "exp", "minutes", "km", "orders", "cash", "litres")
+KEYS = ("yandex", "nal", "tips", "car", "fuel", "other", "exp", "minutes", "km", "orders", "cash", "litres")
 
 
 def fmt(x):
@@ -32,16 +32,17 @@ def month_label(ym):
 
 
 def calc(s, entries):
-    tips = sum(e["amount"] for e in entries if e["kind"] in ("tip", "cash"))
+    tips = sum(e["amount"] for e in entries if e["kind"] == "tip")
+    nal = sum(e["amount"] for e in entries if e["kind"] == "cash")
     by = {k: sum(e["amount"] for e in entries if e["kind"] == k) for k in ("car", "fuel", "other")}
     exp = sum(by.values())
     yandex = s["yandex"] or 0
     end_ts = s["end_ts"] or s["start_ts"]
     km = (s["end_odo"] - s["start_odo"]) if s["end_odo"] is not None else 0
     return {
-        "yandex": yandex, "tips": tips, "car": by["car"], "fuel": by["fuel"], "other": by["other"],
+        "yandex": yandex, "nal": nal, "tips": tips, "car": by["car"], "fuel": by["fuel"], "other": by["other"],
         "exp": exp, "minutes": max(0, (end_ts - s["start_ts"]) // 60), "km": km,
-        "orders": s["orders"] or 0, "cash": yandex + tips - exp,
+        "orders": s["orders"] or 0, "cash": yandex + nal + tips - exp,
         "litres": sum(e["litres"] or 0 for e in entries if e["kind"] == "fuel"),
     }
 
@@ -77,8 +78,9 @@ def day_report(s, entries, n, plan, month_cash):
              f"🟢 На линии: {dur(c['minutes'])}",
              f"🚕 Пробег: {fmt(c['km'])}",
              f"🙋🏻 Заказов: {c['orders']}",
-             f"🫴 Доход: {fmt(c['yandex'])}",
-             f"🤑 Чай и нал: {fmt(c['tips'])}", "",
+             f"🪙 Наличные: {fmt(c['nal'])}",
+             f"🫴 Яндекс: {fmt(c['yandex'])}",
+             f"🤑 Чаевые: {fmt(c['tips'])}", "",
              "📉 Расходы:"] + _exp_block(entries, c)
     return "\n".join(lines)
 
@@ -88,7 +90,8 @@ def status_text(s, entries):
     d = db.dt(s["start_ts"])
     lines = [f"🟢 Смена открыта: {d:%d.%m.%y %H:%M}",
              f"🚕 Пробег на старте: {fmt(s['start_odo'])}",
-             f"🤑 Чай и нал: {fmt(c['tips'])}",
+             f"🪙 Наличные: {fmt(c['nal'])}",
+             f"🤑 Чаевые: {fmt(c['tips'])}",
              f"📉 Расходы: {fmt(c['exp'])}"]
     return "\n".join(lines)
 
@@ -117,8 +120,9 @@ def period_report(kind, title, calcs, by_month=None):
              f"🟢 На линии: {dur(t['minutes'])}",
              f"🚕 Пробег: {fmt(t['km'])}",
              f"🙋🏻 Заказов: {t['orders']}",
-             f"🫴 Доход: {fmt(t['yandex'])}",
-             f"🤑 Чай и нал: {fmt(t['tips'])}", "",
+             f"🪙 Наличные: {fmt(t['nal'])}",
+             f"🫴 Яндекс: {fmt(t['yandex'])}",
+             f"🤑 Чаевые: {fmt(t['tips'])}", "",
              f"📉 Расходы: {fmt(t['exp'])}",
              f"- Машина: {fmt(t['car'])}",
              f"- Заправка: {fmt(t['fuel'])}",
@@ -146,18 +150,18 @@ def build_xlsx(title, items, ents, by_month=None):
 
     ws = wb.active
     ws.title = "Смены"
-    head = ["№", "Дата", "Начало", "Конец", "На линии (ч)", "Пробег", "Заказов", "Доход (Яндекс)",
-            "Чай и нал", "Машина", "Заправка", "Прочее", "Расходы", "Касса дня"]
+    head = ["№", "Дата", "Начало", "Конец", "На линии (ч)", "Пробег", "Заказов", "Наличные",
+            "Яндекс", "Чаевые", "Машина", "Заправка", "Прочее", "Расходы", "Касса дня"]
     ws.append(head)
     for i, (s, c) in enumerate(items, 1):
         st, en = db.dt(s["start_ts"]), db.dt(s["end_ts"])
         ws.append([i, st.strftime("%d.%m.%Y"), st.strftime("%H:%M"), en.strftime("%H:%M"),
-                   round(c["minutes"] / 60, 2), c["km"], c["orders"], c["yandex"], c["tips"],
+                   round(c["minutes"] / 60, 2), c["km"], c["orders"], c["nal"], c["yandex"], c["tips"],
                    c["car"], c["fuel"], c["other"], c["exp"], c["cash"]])
     if items:
         last = len(items) + 1
         ws.append(["Итого", "", "", ""] + [f"=SUM({get_column_letter(col)}2:{get_column_letter(col)}{last})"
-                                          for col in range(5, 15)])
+                                          for col in range(5, 16)])
         for cell in ws[last + 1]:
             cell.font = bold
     _style(ws, head)
@@ -174,14 +178,14 @@ def build_xlsx(title, items, ents, by_month=None):
 
     if by_month:
         ws3 = wb.create_sheet("По месяцам")
-        head3 = ["Месяц", "Смен", "Пробег", "Доход (Яндекс)", "Чай и нал", "Расходы", "Касса"]
+        head3 = ["Месяц", "Смен", "Пробег", "Наличные", "Яндекс", "Чаевые", "Расходы", "Касса"]
         ws3.append(head3)
         for ym, cs in sorted(by_month.items()):
             t = total(cs)
-            ws3.append([month_label(ym), len(cs), t["km"], t["yandex"], t["tips"], t["exp"], t["cash"]])
+            ws3.append([month_label(ym), len(cs), t["km"], t["nal"], t["yandex"], t["tips"], t["exp"], t["cash"]])
         last = len(by_month) + 1
         ws3.append(["Итого"] + [f"=SUM({get_column_letter(col)}2:{get_column_letter(col)}{last})"
-                                for col in range(2, 8)])
+                                for col in range(2, 9)])
         for cell in ws3[last + 1]:
             cell.font = bold
         _style(ws3, head3)
