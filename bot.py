@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -12,17 +12,17 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
                            KeyboardButton, Message, ReplyKeyboardMarkup)
 
+import access as A
 import reports as R
 import storage as db
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("shiftbot")
 
-# Пусто = доступ у всех. На время теста укажите свой Telegram ID: ALLOWED_USERS=123456789
-ALLOWED = {int(x) for x in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if x}
+# Роли и платный режим настраиваются в access.py (переменные ALLOWED_USERS, ADMIN_IDS, PAID_MODE и др.)
+ALLOWED = A.ALLOWED
 REMIND_AT = tuple(int(x) for x in os.getenv("REMIND_AT", "23:30").split(":"))
-# Куда слать ежедневную копию базы и кто может её восстанавливать (по умолчанию — ALLOWED_USERS).
-BACKUP_TO = {int(x) for x in os.getenv("BACKUP_CHAT_IDS", "").replace(" ", "").split(",") if x} or ALLOWED
+BACKUP_TO = A.BACKUP_TO
 BACKUP_AT = tuple(int(x) for x in os.getenv("BACKUP_AT", "23:50").split(":"))
 
 router = Router()
@@ -34,6 +34,36 @@ async def allowed(event) -> bool:
 
 router.message.filter(allowed)
 router.callback_query.filter(allowed)
+
+PAY_KB = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data="pay:sent")]])
+
+
+class AccessMiddleware(BaseMiddleware):
+    """В платном режиме пускает владельцев, оплативших и тех, у кого идёт пробный период."""
+
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+        if A.ALLOWED and user.id not in A.ALLOWED:
+            return None
+        if not A.PAID_MODE:
+            return await handler(event, data)
+        db.touch_user(user.id)
+        if A.has_access(user.id):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery):
+            if (event.data or "").startswith("pay:"):
+                return await handler(event, data)
+            await event.message.answer(A.paywall_text(), reply_markup=PAY_KB)
+            await event.answer()
+        else:
+            await event.answer(A.paywall_text(), reply_markup=PAY_KB)
+        return None
+
+
+router.message.outer_middleware(AccessMiddleware())
+router.callback_query.outer_middleware(AccessMiddleware())
 
 
 def ib(text, data):
@@ -158,8 +188,12 @@ async def cancel(m: Message, state: FSMContext):
 @router.message(CommandStart())
 async def start(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("Привет! Я веду учёт смен: пробег, доходы, расходы и отчёты за день, месяц и год.\n"
-                   "Начните с «▶️ Открыть смену».", reply_markup=main_kb(m.from_user.id))
+    text = ("Привет! Я веду учёт смен: пробег, доходы, расходы и отчёты за день, месяц и год.\n"
+            "Начните с «▶️ Открыть смену».")
+    line = A.status_line(m.from_user.id)
+    if line:
+        text += f"\n\n{line}"
+    await m.answer(text, reply_markup=main_kb(m.from_user.id))
 
 
 # ---------- открытие смены ----------
@@ -625,6 +659,103 @@ async def settings_cb(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
+# ---------- оплата и доступ ----------
+@router.message(Command("access"))
+async def cmd_access(m: Message):
+    line = A.status_line(m.from_user.id)
+    await m.answer(line or "Платный режим выключен: бот доступен всем.")
+
+
+PAY_REQUESTED = {}
+
+
+@router.callback_query(F.data == "pay:sent")
+async def pay_sent(c: CallbackQuery, bot: Bot):
+    uid = c.from_user.id
+    now = db.ts(db.now())
+    if now - PAY_REQUESTED.get(uid, 0) < 300:
+        await c.answer("Заявка уже отправлена, подождите.", show_alert=True)
+        return
+    if not A.ADMINS:
+        await c.answer("Владелец не настроен, напишите ему напрямую.", show_alert=True)
+        return
+    PAY_REQUESTED[uid] = now
+    who = c.from_user.full_name + (f" (@{c.from_user.username})" if c.from_user.username else "")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Открыть доступ", callback_data=f"pay:ok:{uid}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"pay:no:{uid}")]])
+    for admin in A.ADMINS:
+        try:
+            await bot.send_message(admin, f"💳 {who}, id {uid}, сообщает об оплате. Проверьте перевод.",
+                                   reply_markup=kb)
+        except Exception:
+            log.exception("не удалось отправить заявку владельцу")
+    await c.message.answer("Заявка отправлена. Как только владелец проверит перевод, я напишу.")
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("pay:ok:") | F.data.startswith("pay:no:"))
+async def pay_decide(c: CallbackQuery, bot: Bot):
+    if c.from_user.id not in A.ADMINS:
+        await c.answer("Нет прав.", show_alert=True)
+        return
+    _, verdict, raw = c.data.split(":")
+    uid = int(raw)
+    if verdict == "ok":
+        db.set_paid(uid, True)
+        result, note = "✅ Доступ открыт", "✅ Оплата подтверждена, доступ открыт насовсем. Спасибо!"
+    else:
+        result, note = "❌ Отклонено", ("Не нашёл ваш перевод. Если вы оплатили, напишите владельцу "
+                                       "и нажмите «Я оплатил(а)» ещё раз.")
+    try:
+        await bot.send_message(uid, note, reply_markup=main_kb(uid))
+    except Exception:
+        log.exception("не удалось написать пользователю")
+    await show(c, f"{c.message.text}\n\n{result}")
+    await c.answer()
+
+
+def _uid_arg(m: Message):
+    parts = (m.text or "").split()
+    return int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else None
+
+
+@router.message(Command("grant"))
+async def cmd_grant(m: Message):
+    if m.from_user.id not in A.ADMINS:
+        return
+    uid = _uid_arg(m)
+    if uid is None:
+        await m.answer("Использование: /grant 123456789")
+        return
+    db.set_paid(uid, True)
+    await m.answer(f"✅ Доступ насовсем открыт для {uid}.")
+
+
+@router.message(Command("revoke"))
+async def cmd_revoke(m: Message):
+    if m.from_user.id not in A.ADMINS:
+        return
+    uid = _uid_arg(m)
+    if uid is None:
+        await m.answer("Использование: /revoke 123456789")
+        return
+    db.set_paid(uid, False)
+    await m.answer(f"Платный доступ для {uid} снят (если пробный период кончился, бот попросит оплату).")
+
+
+@router.message(Command("users"))
+async def cmd_users(m: Message):
+    if m.from_user.id not in A.ADMINS:
+        return
+    rows = db.all_users()
+    paid = sum(1 for r in rows if r["paid"])
+    trial = sum(1 for r in rows if not r["paid"] and A.trial_left(r["user_id"]) > 0)
+    await m.answer(f"Пользователей: {len(rows)}\nОплатили: {paid}\nНа пробном периоде: {trial}\n"
+                   f"Пробный период закончился: {len(rows) - paid - trial}\n"
+                   f"Платный режим: {'вкл' if A.PAID_MODE else 'выкл'}")
+
+
 # ---------- копия базы ----------
 async def send_backup(bot: Bot, chat_id, caption="Копия базы. Чтобы восстановить, отправьте этот файл боту."):
     data = db.backup_bytes()
@@ -699,6 +830,8 @@ async def backup_loop(bot: Bot):
 
 async def main():
     db.init()
+    if A.PAID_MODE and not A.ADMINS:
+        log.error("PAID_MODE включён, но ADMIN_IDS не задан: заявки на оплату некому подтверждать")
     bot = Bot(token=os.environ["BOT_TOKEN"])
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)

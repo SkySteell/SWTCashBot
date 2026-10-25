@@ -13,7 +13,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
     user_id INTEGER PRIMARY KEY,
     litres INTEGER NOT NULL DEFAULT 0,
-    backup INTEGER NOT NULL DEFAULT 0
+    backup INTEGER NOT NULL DEFAULT 0,
+    first_seen INTEGER,
+    paid INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS plans(
     user_id INTEGER NOT NULL,
@@ -64,9 +66,11 @@ def init(path=None):
         _conn.executescript(SCHEMA)
         _conn.commit()
         cols = {r["name"] for r in _conn.execute("PRAGMA table_info(users)")}
-        if "backup" not in cols:  # база создана старой версией
-            _conn.execute("ALTER TABLE users ADD COLUMN backup INTEGER NOT NULL DEFAULT 0")
-            _conn.commit()
+        for name, ddl in (("backup", "INTEGER NOT NULL DEFAULT 0"), ("first_seen", "INTEGER"),
+                          ("paid", "INTEGER NOT NULL DEFAULT 0")):
+            if name not in cols:  # база создана старой версией
+                _conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
+        _conn.commit()
 
 
 def q(sql, args=()):
@@ -132,6 +136,27 @@ def set_backup(uid, on):
 
 def backup_users():
     return [r["user_id"] for r in q("SELECT user_id FROM users WHERE backup=1")]
+
+
+def get_user(uid):
+    r = q("SELECT * FROM users WHERE user_id=?", (uid,))
+    return r[0] if r else None
+
+
+def touch_user(uid):
+    """Запоминает момент первого обращения (с него идёт пробный период)."""
+    ex("INSERT INTO users(user_id, first_seen) VALUES(?, ?) "
+       "ON CONFLICT(user_id) DO UPDATE SET first_seen=COALESCE(users.first_seen, excluded.first_seen)",
+       (uid, ts(now())))
+
+
+def set_paid(uid, on):
+    ex("INSERT INTO users(user_id, paid) VALUES(?, ?) "
+       "ON CONFLICT(user_id) DO UPDATE SET paid=excluded.paid", (uid, int(on)))
+
+
+def all_users():
+    return q("SELECT * FROM users WHERE first_seen IS NOT NULL OR paid=1")
 
 
 def get_plan(uid, ym):
