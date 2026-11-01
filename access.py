@@ -65,3 +65,14 @@ def paywall_text():
             f"Доступ насовсем открывается разовым переводом{price} на карту:\n{card}\n\n"
             "После перевода нажмите «Я оплатил(а)»: владелец проверит и откроет доступ. "
             "Ваши смены и отчёты сохранены.")
+
+
+def user_status(row):
+    """(код, текст) для списка /users: paid, trial или expired."""
+    uid = row["user_id"]
+    if uid in ADMINS or row["paid"]:
+        return "paid", "оплачено (навсегда)"
+    left = trial_left(uid)
+    if left > 0:
+        return "trial", f"пробный период, осталось дней: {-(-left // 86400)}"
+    return "expired", "пробный период закончился"

@@ -15,7 +15,9 @@ CREATE TABLE IF NOT EXISTS users(
     litres INTEGER NOT NULL DEFAULT 0,
     backup INTEGER NOT NULL DEFAULT 0,
     first_seen INTEGER,
-    paid INTEGER NOT NULL DEFAULT 0
+    paid INTEGER NOT NULL DEFAULT 0,
+    name TEXT,
+    username TEXT
 );
 CREATE TABLE IF NOT EXISTS plans(
     user_id INTEGER NOT NULL,
@@ -67,7 +69,7 @@ def init(path=None):
         _conn.commit()
         cols = {r["name"] for r in _conn.execute("PRAGMA table_info(users)")}
         for name, ddl in (("backup", "INTEGER NOT NULL DEFAULT 0"), ("first_seen", "INTEGER"),
-                          ("paid", "INTEGER NOT NULL DEFAULT 0")):
+                          ("paid", "INTEGER NOT NULL DEFAULT 0"), ("name", "TEXT"), ("username", "TEXT")):
             if name not in cols:  # база создана старой версией
                 _conn.execute(f"ALTER TABLE users ADD COLUMN {name} {ddl}")
         _conn.commit()
@@ -143,11 +145,20 @@ def get_user(uid):
     return r[0] if r else None
 
 
-def touch_user(uid):
-    """Запоминает момент первого обращения (с него идёт пробный период)."""
-    ex("INSERT INTO users(user_id, first_seen) VALUES(?, ?) "
-       "ON CONFLICT(user_id) DO UPDATE SET first_seen=COALESCE(users.first_seen, excluded.first_seen)",
-       (uid, ts(now())))
+def is_new_user(uid):
+    """Новый = о нём нет ни строки в users, ни смен (старые пользователи новыми не считаются)."""
+    if get_user(uid) is not None:
+        return False
+    return not q("SELECT 1 FROM shifts WHERE user_id=? LIMIT 1", (uid,))
+
+
+def touch_user(uid, name=None, username=None):
+    """Запоминает момент первого обращения (с него идёт пробный период), имя и @username."""
+    ex("INSERT INTO users(user_id, first_seen, name, username) VALUES(?, ?, ?, ?) "
+       "ON CONFLICT(user_id) DO UPDATE SET first_seen=COALESCE(users.first_seen, excluded.first_seen), "
+       "name=COALESCE(excluded.name, users.name), "
+       "username=CASE WHEN excluded.name IS NULL THEN users.username ELSE excluded.username END",
+       (uid, ts(now()), name, username))
 
 
 def set_paid(uid, on):
@@ -156,7 +167,7 @@ def set_paid(uid, on):
 
 
 def all_users():
-    return q("SELECT * FROM users WHERE first_seen IS NOT NULL OR paid=1")
+    return q("SELECT * FROM users WHERE first_seen IS NOT NULL OR paid=1 ORDER BY first_seen DESC")
 
 
 def get_plan(uid, ym):

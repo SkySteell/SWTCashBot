@@ -38,6 +38,19 @@ router.callback_query.filter(allowed)
 PAY_KB = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data="pay:sent")]])
 
 
+async def notify_new_user(bot, user):
+    """Сообщает владельцам, что к боту подключился новый пользователь."""
+    who = user.full_name + (f" @{user.username}" if user.username else "")
+    text = f"🆕 Новый пользователь: {who}\nid {user.id}\nВсего пользователей: {len(db.all_users())}"
+    if A.PAID_MODE:
+        text += f"\nПробный период: {A.TRIAL_DAYS} дн."
+    for admin in A.ADMINS:
+        try:
+            await bot.send_message(admin, text)
+        except Exception:
+            log.exception("не удалось отправить уведомление о новом пользователе")
+
+
 class AccessMiddleware(BaseMiddleware):
     """В платном режиме пускает владельцев, оплативших и тех, у кого идёт пробный период."""
 
@@ -47,9 +60,12 @@ class AccessMiddleware(BaseMiddleware):
             return await handler(event, data)
         if A.ALLOWED and user.id not in A.ALLOWED:
             return None
+        if user.id not in A.ADMINS and db.is_new_user(user.id):
+            db.touch_user(user.id, user.full_name, user.username)
+            await notify_new_user(data["bot"], user)
         if not A.PAID_MODE:
             return await handler(event, data)
-        db.touch_user(user.id)
+        db.touch_user(user.id, user.full_name, user.username)
         if A.has_access(user.id):
             return await handler(event, data)
         if isinstance(event, CallbackQuery):
@@ -749,11 +765,24 @@ async def cmd_users(m: Message):
     if m.from_user.id not in A.ADMINS:
         return
     rows = db.all_users()
-    paid = sum(1 for r in rows if r["paid"])
-    trial = sum(1 for r in rows if not r["paid"] and A.trial_left(r["user_id"]) > 0)
-    await m.answer(f"Пользователей: {len(rows)}\nОплатили: {paid}\nНа пробном периоде: {trial}\n"
-                   f"Пробный период закончился: {len(rows) - paid - trial}\n"
-                   f"Платный режим: {'вкл' if A.PAID_MODE else 'выкл'}")
+    counts = {"paid": 0, "trial": 0, "expired": 0}
+    lines = []
+    for r in rows:
+        code, status = A.user_status(r)
+        counts[code] += 1
+        parts = [str(r["user_id"]), (r["name"] or "").strip(), f"@{r['username']}" if r["username"] else ""]
+        lines.append(" ".join(p for p in parts if p) + f" — {status}")
+    head = (f"Всего: {len(rows)} · оплатили: {counts['paid']} · на пробном: {counts['trial']} · "
+            f"закончился пробный: {counts['expired']}")
+    text, chunks = head + "\n", []
+    for line in lines:
+        if len(text) + len(line) > 3800:
+            chunks.append(text)
+            text = ""
+        text += "\n" + line
+    chunks.append(text)
+    for chunk in chunks:
+        await m.answer(chunk)
 
 
 # ---------- копия базы ----------
