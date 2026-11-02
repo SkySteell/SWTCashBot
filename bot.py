@@ -63,6 +63,10 @@ class AccessMiddleware(BaseMiddleware):
         if user.id not in A.ADMINS and db.is_new_user(user.id):
             db.touch_user(user.id, user.full_name, user.username)
             await notify_new_user(data["bot"], user)
+        else:
+            known = db.get_user(user.id)
+            if known is None or known["name"] != user.full_name or known["username"] != user.username:
+                db.set_profile(user.id, user.full_name, user.username)
         if not A.PAID_MODE:
             return await handler(event, data)
         db.touch_user(user.id, user.full_name, user.username)

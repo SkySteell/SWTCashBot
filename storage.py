@@ -145,6 +145,13 @@ def get_user(uid):
     return r[0] if r else None
 
 
+def set_profile(uid, name, username):
+    """Обновляет имя и @username, не трогая начало пробного периода."""
+    ex("INSERT INTO users(user_id, name, username) VALUES(?, ?, ?) "
+       "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username",
+       (uid, name, username))
+
+
 def is_new_user(uid):
     """Новый = о нём нет ни строки в users, ни смен (старые пользователи новыми не считаются)."""
     if get_user(uid) is not None:
