@@ -145,6 +145,11 @@ def get_user(uid):
     return r[0] if r else None
 
 
+def all_user_ids():
+    """Все, кто когда-либо пользовался ботом (есть в users или есть смены)."""
+    return [r[0] for r in q("SELECT user_id FROM users UNION SELECT DISTINCT user_id FROM shifts")]
+
+
 def set_profile(uid, name, username):
     """Обновляет имя и @username, не трогая начало пробного периода."""
     ex("INSERT INTO users(user_id, name, username) VALUES(?, ?, ?) "

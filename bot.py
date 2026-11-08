@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timedelta
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -103,9 +103,9 @@ KIND_ICONS = {"tip": "💰", "cash": "💵", "car": "🚗", "fuel": "⛽", "othe
 def main_kb(uid):
     if db.open_shift(uid):
         rows = [["💰 Чаевые", "💵 Наличка"], ["🚗 Машина", "⛽ Заправка", "🧾 Прочее"],
-                ["📋 Записи смены", "🏁 Закрыть смену"], ["📊 Отчёты", "⚙️ Настройки"]]
+                ["📋 Записи смены", "🏁 Закрыть смену"], ["📊 Отчёты", "⚙️ Настройки", "📖 Инструкция"]]
     else:
-        rows = [["▶️ Открыть смену"], ["📊 Отчёты", "⚙️ Настройки"]]
+        rows = [["▶️ Открыть смену"], ["📊 Отчёты", "⚙️ Настройки", "📖 Инструкция"]]
     return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t) for t in r] for r in rows], resize_keyboard=True)
 
 
@@ -119,6 +119,8 @@ class S(StatesGroup):
     close_yandex = State()
     close_orders = State()
     edit = State()
+    bc_text = State()
+    bc_confirm = State()
 
 
 # ---------- разбор ввода ----------
@@ -213,6 +215,38 @@ async def start(m: Message, state: FSMContext):
     line = A.status_line(m.from_user.id)
     if line:
         text += f"\n\n{line}"
+    await m.answer(text, reply_markup=main_kb(m.from_user.id))
+
+
+# ---------- инструкция ----------
+INSTRUCTION = """📖 Инструкция
+
+1. «▶️ Открыть смену»: введите пробег по спидометру. Время начала бот поставит сам. В начале месяца бот спросит, сколько смен вы планируете.
+
+2. Во время смены добавляйте записи кнопками, каждую сумму отдельно:
+💰 Чаевые · 💵 Наличка · 🚗 Машина (мойка, парковка, штраф, ТО) · ⛽ Заправка · 🧾 Прочее
+
+3. Ошиблись? «📋 Записи смены»: ✏️ исправить сумму, 🗑 удалить запись.
+
+4. «🏁 Закрыть смену»: введите конечный пробег, сумму из Яндекса (без комиссии и налога) и число заказов. Бот пришлёт отчёт за смену.
+
+5. «📊 Отчёты»: месяц, год, прошлые периоды, правка закрытых смен и выгрузка в Excel.
+
+💰 Касса дня = наличные + Яндекс + чаевые − расходы.
+⏰ Если смена не закрыта к 23:30, бот напомнит. Сам он её не закроет.
+
+Команды: /month — отчёт за месяц, /year — за год.
+Кнопка «❌ Отмена» прерывает ввод."""
+
+
+@router.message(F.text == "📖 Инструкция")
+@router.message(Command("help"))
+async def instruction(m: Message, state: FSMContext):
+    await state.clear()
+    text = INSTRUCTION
+    line = A.status_line(m.from_user.id)
+    if line:
+        text += f"\n\n🔑 {line}"
     await m.answer(text, reply_markup=main_kb(m.from_user.id))
 
 
@@ -787,6 +821,91 @@ async def cmd_users(m: Message):
     chunks.append(text)
     for chunk in chunks:
         await m.answer(chunk)
+
+
+# ---------- рассылка сообщений пользователям ----------
+async def send_copy(bot: Bot, uid, chat_id, message_id):
+    """Копирует сообщение владельца пользователю (сохраняет форматирование, фото, файлы)."""
+    for _ in range(2):
+        try:
+            await bot.copy_message(uid, chat_id, message_id)
+            return True
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            return False  # пользователь заблокировал бота или удалил чат
+        except Exception:
+            log.exception("ошибка рассылки")
+            return False
+    return False
+
+
+def broadcast_targets(sender_id, target):
+    if target:
+        return [target]
+    return [u for u in db.all_user_ids() if u != sender_id]
+
+
+@router.message(Command("send"))
+async def cmd_send(m: Message, state: FSMContext):
+    if m.from_user.id not in A.ADMINS:
+        return
+    await state.clear()
+    parts = (m.text or "").split()
+    target = None
+    if len(parts) > 1:
+        if not parts[1].lstrip("-").isdigit():
+            await m.answer("Использование: /send (всем) или /send 123456789 (одному пользователю)")
+            return
+        target = int(parts[1])
+    await state.set_state(S.bc_text)
+    await state.update_data(target=target)
+    who = f"пользователю {target}" if target else f"всем пользователям ({len(broadcast_targets(m.from_user.id, None))})"
+    await m.answer(f"Пришлите сообщение, которое получит: {who}. Подойдёт текст, фото или файл с подписью. "
+                   "Форматирование сохранится.", reply_markup=CANCEL_KB)
+
+
+@router.message(S.bc_text)
+async def bc_got_text(m: Message, state: FSMContext, bot: Bot):
+    d = await state.get_data()
+    await state.set_state(S.bc_confirm)
+    await state.update_data(chat_id=m.chat.id, message_id=m.message_id)
+    n = len(broadcast_targets(m.from_user.id, d.get("target")))
+    await bot.copy_message(m.chat.id, m.chat.id, m.message_id)  # предпросмотр
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Отправить", callback_data="bc:go"),
+                                                InlineKeyboardButton(text="❌ Отмена", callback_data="bc:no")]])
+    await m.answer(f"Так это увидят пользователи. Отправить ({n})?", reply_markup=kb)
+
+
+@router.callback_query(F.data == "bc:no")
+async def bc_cancel(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id in A.ADMINS:
+        await state.clear()
+        await show(c, "Отменено.")
+        await c.message.answer("Рассылка отменена.", reply_markup=main_kb(c.from_user.id))
+    await c.answer()
+
+
+@router.callback_query(F.data == "bc:go")
+async def bc_go(c: CallbackQuery, state: FSMContext, bot: Bot):
+    if c.from_user.id not in A.ADMINS:
+        await c.answer("Нет прав.", show_alert=True)
+        return
+    d = await state.get_data()
+    if "message_id" not in d:
+        await c.answer("Сессия устарела, начните заново: /send", show_alert=True)
+        return
+    await state.clear()
+    targets = broadcast_targets(c.from_user.id, d.get("target"))
+    await show(c, f"Отправляю: {len(targets)}…")
+    ok = 0
+    for uid in targets:
+        if await send_copy(bot, uid, d["chat_id"], d["message_id"]):
+            ok += 1
+        await asyncio.sleep(0.05)  # не выходим за лимит Telegram
+    await c.message.answer(f"✅ Рассылка завершена. Доставлено: {ok}, не доставлено: {len(targets) - ok} "
+                           "(заблокировали бота или удалили чат).", reply_markup=main_kb(c.from_user.id))
+    await c.answer()
 
 
 # ---------- копия базы ----------
