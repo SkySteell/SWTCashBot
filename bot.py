@@ -230,12 +230,12 @@ INSTRUCTION = """📖 Инструкция
 
 4. «🏁 Закрыть смену»: введите конечный пробег, сумму из Яндекса (без комиссии и налога) и число заказов. Бот пришлёт отчёт за смену.
 
-5. «📊 Отчёты»: месяц, год, прошлые периоды, правка закрытых смен и выгрузка в Excel.
+5. «📊 Отчёты»: неделя, месяц, год, прошлые периоды, правка закрытых смен и выгрузка в Excel.
 
 💰 Касса дня = наличные + Яндекс + чаевые − расходы.
 ⏰ Если смена не закрыта к 23:30, бот напомнит. Сам он её не закроет.
 
-Команды: /month — отчёт за месяц, /year — за год.
+Команды: /week — отчёт за неделю, /month — за месяц, /year — за год.
 Кнопка «❌ Отмена» прерывает ввод."""
 
 
@@ -560,7 +560,8 @@ async def got_edit(m: Message, state: FSMContext):
 
 
 # ---------- отчёты ----------
-REPORTS_KB = ikb([[ib("📅 Текущий месяц", "r:m:cur"), ib("🗓 Текущий год", "r:y:cur")],
+REPORTS_KB = ikb([[ib("🗒 Текущая неделя", "r:w:cur"), ib("🗒 Другие недели", "r:wl")],
+                  [ib("📅 Текущий месяц", "r:m:cur"), ib("🗓 Текущий год", "r:y:cur")],
                   [ib("📆 Другие месяцы", "r:ml"), ib("📚 Другие годы", "r:yl")],
                   [ib("🗂 Смены текущего месяца", "r:sl:cur")]])
 
@@ -576,6 +577,27 @@ def month_view(uid, ym):
     calcs = [R.calc(s, ents.get(s["id"], [])) for s in shifts]
     text = R.period_report("month", R.month_label(ym), calcs)
     kb = ikb([[ib("📥 Excel", f"x:m:{ym}"), ib("🗂 Смены", f"r:sl:{ym}")]]) if shifts else None
+    return text, kb
+
+
+def week_range_label(a):
+    d1 = db.dt(a)
+    d2 = d1 + timedelta(days=6)
+    return f"{d1:%d.%m}–{d2:%d.%m.%Y}"
+
+
+def week_view(uid, key):
+    a, b = db.week_bounds(key)
+    shifts = db.shifts_between(uid, a, b)
+    ents = db.entries_for([s["id"] for s in shifts])
+    calcs = [R.calc(s, ents.get(s["id"], [])) for s in shifts]
+    by_day = {}
+    for s, c in zip(shifts, calcs):
+        d = db.dt(s["start_ts"])
+        label = f"{R.WD[d.weekday()]} {d:%d.%m}"
+        by_day[label] = by_day.get(label, 0) + c["cash"]
+    text = R.period_report("week", week_range_label(a), calcs, by_day=list(by_day.items()))
+    kb = ikb([[ib("🗂 Смены", f"r:sw:{key}")]]) if shifts else None
     return text, kb
 
 
@@ -601,6 +623,12 @@ async def reports_menu(m: Message, state: FSMContext):
 @router.message(Command("month"))
 async def cmd_month(m: Message):
     t, kb = month_view(m.from_user.id, cur_ym())
+    await m.answer(t, reply_markup=kb)
+
+
+@router.message(Command("week"))
+async def cmd_week(m: Message):
+    t, kb = week_view(m.from_user.id, db.week_key(db.ts(db.now())))
     await m.answer(t, reply_markup=kb)
 
 
@@ -636,6 +664,31 @@ async def reports_cb(c: CallbackQuery):
         else:
             btns = [ib(str(y), f"r:y:{y}") for y in years]
             await show(c, "Выберите год:", ikb([btns[i:i + 4] for i in range(0, len(btns), 4)]))
+    elif act == "w":
+        t, kb = week_view(uid, db.week_key(db.ts(db.now())) if key == "cur" else key)
+        await show(c, t, kb)
+    elif act == "wl":
+        weeks = db.weeks_with_data(uid)
+        if not weeks:
+            await show(c, "Закрытых смен пока нет.", REPORTS_KB)
+        else:
+            btns = [ib(week_range_label(db.week_bounds(k)[0]).rsplit(".", 1)[0], f"r:w:{k}") for k in weeks[:12]]
+            await show(c, "Выберите неделю:", ikb([btns[i:i + 2] for i in range(0, len(btns), 2)]))
+    elif act == "sw":
+        key = db.week_key(db.ts(db.now())) if key == "cur" else key
+        a, b = db.week_bounds(key)
+        shifts = db.shifts_between(uid, a, b, closed=False)
+        if not shifts:
+            await show(c, "На этой неделе смен нет.", REPORTS_KB)
+        else:
+            ents = db.entries_for([s["id"] for s in shifts])
+            rows = []
+            for s in shifts:
+                d = db.dt(s["start_ts"])
+                label = f"{R.WD[d.weekday()]} {d:%d.%m}"
+                label += (f" · {R.fmt(R.calc(s, ents.get(s['id'], []))['cash'])}" if s["end_ts"] else " · открыта")
+                rows.append([ib(label, f"sh:{s['id']}")])
+            await show(c, f"Смены недели {week_range_label(a)}. Нажмите, чтобы посмотреть или исправить.", ikb(rows))
     elif act == "sl":
         ym = cur_ym() if key == "cur" else key
         a, b = db.month_bounds(ym)

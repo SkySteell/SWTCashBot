@@ -108,12 +108,12 @@ def entries_text(entries):
     return "\n".join(out)
 
 
-def period_report(kind, title, calcs, by_month=None):
+def period_report(kind, title, calcs, by_month=None, by_day=None):
     n = len(calcs)
     if n == 0:
         return f"За {title} закрытых смен пока нет."
     t = total(calcs)
-    word = "месяца" if kind == "month" else "года"
+    word = {"week": "недели", "month": "месяца"}.get(kind, "года")
     lines = [f"🗓️ Итоги {word}: {title}", "",
              f"🎰 Касса {word}: {fmt(t['cash'])}",
              f"📊 Смен: {n} (в среднем {fmt(round(t['cash'] / n))} за смену)", "",
@@ -140,6 +140,11 @@ def period_report(kind, title, calcs, by_month=None):
                  for ym, cs in sorted(by_month.items())]
         for i in range(0, len(cells), 3):
             lines.append(" · ".join(cells[i:i + 3]))
+    if by_day:
+        lines += ["", "📅 По дням (касса):"]
+        cells = [f"{label} {fmt(v)}" for label, v in by_day]
+        for i in range(0, len(cells), 2):
+            lines.append(" · ".join(cells[i:i + 2]))
     return "\n".join(lines)
 
 

@@ -3,7 +3,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
@@ -109,6 +109,18 @@ def month_bounds(ym):
     a = datetime(y, m, 1, tzinfo=TZ)
     b = datetime(y + (1 if m == 12 else 0), m % 12 + 1, 1, tzinfo=TZ)
     return ts(a), ts(b)
+
+
+def week_key(t):
+    """Неделя с понедельника: ключ — дата понедельника ГГГГ-ММ-ДД."""
+    d = dt(t).date()
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+
+def week_bounds(key):
+    y, m, d = map(int, key.split("-"))
+    a = datetime(y, m, d, tzinfo=TZ)
+    return ts(a), ts(a + timedelta(days=7))
 
 
 def year_bounds(y):
@@ -242,6 +254,11 @@ def periods(uid):
     months = sorted({month_key(r["start_ts"]) for r in rows}, reverse=True)
     years = sorted({int(m[:4]) for m in months}, reverse=True)
     return months, years
+
+
+def weeks_with_data(uid):
+    rows = q("SELECT start_ts FROM shifts WHERE user_id=? AND end_ts IS NOT NULL", (uid,))
+    return sorted({week_key(r["start_ts"]) for r in rows}, reverse=True)
 
 
 # ---------- записи ----------
